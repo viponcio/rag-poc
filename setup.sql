@@ -2,7 +2,7 @@
 create extension if not exists vector;
 
 -- Create documents table
-create table if not exists documents (
+create table if not exists doc (
     id bigserial primary KEY,
     content TEXT,
     embedding vector(1536)
@@ -24,11 +24,11 @@ as $$
 begin
   return query
   select
-    documents.id,
-    documents.content,
-    1 - (documents.embedding <=> query_embedding) as similarity
-  from documents
-  where 1 - (documents.embedding <=> query_embedding) > match_threshold
+    doc.id,
+    doc.content,
+    1 - (doc.embedding <=> query_embedding) as similarity
+  from doc
+  where 1 - (doc.embedding <=> query_embedding) > match_threshold
   order by similarity desc
   limit match_count;
 end;

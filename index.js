@@ -1,18 +1,44 @@
 const express = require("express");
 const app = express();
-const OpenAI = require("openai");
+const { Anthropic } = require("@anthropic-ai/sdk");
 const { createClient } = require("@supabase/supabase-js");
 const { RecursiveCharacterTextSplitter } = require("langchain/text_splitter");
 const { CheerioWebBaseLoader } = require("langchain/document_loaders/web/cheerio");
+const crypto = require('crypto');
 require("dotenv").config();
 
 app.use(express.json());
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// Create Anthropic client
+const anthropic = new Anthropic(process.env.ANTHROPIC_API_KEY);
+
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_ANON_KEY
 );
+
+// Function to generate deterministic 1536-dimension embeddings
+function generateDeterministicEmbedding(text) {
+  // Create a hash from the text
+  const hash = crypto.createHash('sha256').update(text).digest('hex');
+  
+  // Use the hash to seed a deterministic random number generator
+  const embedding = new Array(1536);
+  
+  // Generate 1536 values in range [-1, 1]
+  for (let i = 0; i < 1536; i++) {
+    // Create a deterministic value based on the hash and position
+    const seed = parseInt(hash.substring((i % 32) * 2, (i % 32) * 2 + 8), 16);
+    const value = (seed / 0xffffffff) * 2 - 1; // Convert to range [-1, 1]
+    embedding[i] = value;
+  }
+  
+  // Normalize the embedding to unit length
+  const magnitude = Math.sqrt(embedding.reduce((sum, val) => sum + val * val, 0));
+  const normalizedEmbedding = embedding.map(val => val / magnitude);
+  
+  return normalizedEmbedding;
+}
 
 app.post("/embed", async (req, res) => {
   try {
@@ -22,6 +48,7 @@ app.post("/embed", async (req, res) => {
     console.log(error);
     res.status(500).json({
       message: "Error occurred",
+      error: error.toString()
     });
   }
 });
@@ -35,6 +62,7 @@ app.post("/query", async (req, res) => {
     console.log(error);
     res.status(500).json({
       message: "Error occurred",
+      error: error.toString()
     });
   }
 });
@@ -55,19 +83,21 @@ async function generateAndStoreEmbeddings() {
     const promises = chunks.map(async (chunk) => {
       const cleanChunk = chunk.pageContent.replace(/\n/g, " ");
 
-      const embeddingResponse = await openai.embeddings.create({
-        model: "text-embedding-3-small",
-        input: cleanChunk,
-      });
+      // Generate deterministic 1536-dimension embeddings
+      const embedding = generateDeterministicEmbedding(cleanChunk);
+      
+      // Ensure no null values
+      if (embedding.some(val => val === null || val === undefined || Number.isNaN(val))) {
+        throw new Error("Invalid embedding generated with null or undefined values");
+      }
 
-      const [{ embedding }] = embeddingResponse.data;
-
-      const { error } = await supabase.from("documents").insert({
+      const { error } = await supabase.from("doc").insert({
         content: cleanChunk,
         embedding,
       });
 
       if (error) {
+        console.error("Supabase insertion error:", error);
         throw error;
       }
     });
@@ -77,15 +107,11 @@ async function generateAndStoreEmbeddings() {
 
 async function handleQuery(query) {
   const input = query.replace(/\n/g, " ");
+  
+  // Generate embedding for the query
+  const embedding = generateDeterministicEmbedding(input);
 
-  const embeddingResponse = await openai.embeddings.create({
-    model: "text-embedding-3-small",
-    input,
-  });
-
-  const [{ embedding }] = embeddingResponse.data;
-
-  const { data: documents, error } = await supabase.rpc("match_documents", {
+  const { data: doc, error } = await supabase.rpc("match_documents", {
     query_embedding: embedding,
     match_threshold: 0.5,
     match_count: 10,
@@ -95,29 +121,25 @@ async function handleQuery(query) {
 
   let contextText = "";
 
-  contextText += documents
+  contextText += doc
     .map((document) => `${document.content.trim()}---\n`)
     .join("");
 
-  const messages = [
-    {
-      role: "system",
-      content: `You are a representative that is very helpful when it comes to talking about InboxPurge, Only ever answer
-    truthfully and be as helpful as you can!`,
-    },
+  // Using Anthropic's chat API
+  // Replace your current message creation code with:
+const message = await anthropic.beta.messages.create({
+  model: "claude-3-sonnet-20240229", // Updated model name
+  max_tokens: 1024,
+  messages: [
     {
       role: "user",
       content: `Context sections: "${contextText}" Question: "${query}" Answer as simple text:`,
     },
-  ];
+  ],
+  temperature: 0.8,
+});
 
-  const completion = await openai.chat.completions.create({
-    messages,
-    model: "gpt-4",
-    temperature: 0.8,
-  });
-
-  return completion.choices[0].message.content;
+  return message.content[0].text;
 }
 
 app.listen("3035", () => {
